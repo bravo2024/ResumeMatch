@@ -1,96 +1,66 @@
+"""core.py — Semantic text matching metrics for ResumeMatch (InfoEdge).
+
+Implements text-matching/ranking metrics, NOT generic classification:
+  * **recall@k** — fraction of relevant resumes in top-k.
+  * **MRR** — reciprocal rank of first relevant resume.
+  * **cosine_similarity** — vector similarity for embeddings.
+  * **match_quality** — weighted score combining rank and relevance.
+
+Different from JobMatch (feature-based LTR): ResumeMatch operates on
+TEXT (resume and job description strings), not tabular features.
+
+References
+----------
+Deerwester et al. (1990), "Indexing by Latent Semantic Analysis."
+Robertson & Zaragoza (2009), "The Probabilistic Relevance Framework."
+"""
 from __future__ import annotations
+import re
 import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.metrics import (
-    roc_auc_score, accuracy_score, precision_score, recall_score, f1_score,
-    confusion_matrix, roc_curve, precision_recall_curve,
-)
-import xgboost as xgb
+from collections import Counter
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_STOPWORDS = frozenset("a an the and or of to in on for is are was were be with as at by it its from this that to you we our".split())
 
 
-def compute_metrics(y_true, y_pred, y_proba=None):
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-    metrics = {
-        "accuracy": accuracy_score(y_true, y_pred),
-        "precision": precision_score(y_true, y_pred, zero_division=0),
-        "recall": recall_score(y_true, y_pred, zero_division=0),
-        "f1": f1_score(y_true, y_pred, zero_division=0),
-        "specificity": tn / (tn + fp) if (tn + fp) > 0 else 0.0,
-        "fpr": fp / (fp + tn) if (fp + tn) > 0 else 0.0,
-        "fnr": fn / (fn + tp) if (fn + tp) > 0 else 0.0,
-    }
-    if y_proba is not None:
-        metrics["roc_auc"] = roc_auc_score(y_true, y_proba)
-        metrics["gini"] = 2.0 * metrics["roc_auc"] - 1.0
-    return metrics
+def _tokenize(text: str) -> list[str]:
+    return [t for t in _TOKEN_RE.findall(text.lower()) if len(t) >= 2 and t not in _STOPWORDS]
 
 
-def ks_statistic(y_true, y_score):
-    ix = np.argsort(y_score)
-    y_true_sorted = y_true[ix]
-    y_score_sorted = y_score[ix]
-    n_total = len(y_true_sorted)
-    n_event = y_true_sorted.sum()
-    n_non_event = n_total - n_event
-    cum_event = np.cumsum(y_true_sorted) / n_event
-    cum_non_event = np.cumsum(1 - y_true_sorted) / n_non_event
-    return np.max(np.abs(cum_event - cum_non_event))
+def cosine_similarity(v1, v2) -> float:
+    """Cosine similarity between two vectors."""
+    v1 = np.asarray(v1, dtype=float)
+    v2 = np.asarray(v2, dtype=float)
+    norm = np.linalg.norm(v1) * np.linalg.norm(v2)
+    return float(np.dot(v1, v2) / norm) if norm > 0 else 0.0
 
 
-def population_stability_index(expected, actual, n_bins=10):
-    eps = 1e-10
-    bins = np.linspace(0, 1, n_bins + 1)
-    bin_labels = np.digitize(np.clip(np.concatenate([expected, actual]), 0, 0.999), bins[1:-1]) - 1
-    expected_counts = np.bincount(bin_labels[:len(expected)], minlength=n_bins)
-    actual_counts = np.bincount(bin_labels[len(expected):], minlength=n_bins)
-    expected_pct = expected_counts / expected_counts.sum()
-    actual_pct = actual_counts / actual_counts.sum()
-    psi = np.sum((actual_pct - expected_pct) * np.log((actual_pct + eps) / (expected_pct + eps)))
-    return psi
+def recall_at_k(ranked_ids, relevant_ids, k):
+    relevant = set(relevant_ids)
+    if not relevant or k <= 0:
+        return 0.0
+    return sum(1 for r in list(ranked_ids)[:k] if r in relevant) / len(relevant)
 
 
-def build_models(X_train, y_train, seed=42):
-    lr = LogisticRegression(C=0.1, class_weight="balanced", solver="liblinear", random_state=seed, max_iter=1000)
-    lr.fit(X_train, y_train)
-    rf = RandomForestClassifier(n_estimators=200, max_depth=8, min_samples_leaf=20,
-                                class_weight="balanced", random_state=seed, n_jobs=-1)
-    rf.fit(X_train, y_train)
-    gbt = GradientBoostingClassifier(n_estimators=200, max_depth=5, min_samples_leaf=20,
-                                     learning_rate=0.05, subsample=0.8, random_state=seed)
-    gbt.fit(X_train, y_train)
-    xgb_model = xgb.XGBClassifier(
-        n_estimators=200, max_depth=5, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8,
-        scale_pos_weight=(y_train.mean() > 0.1) * 1.0 + (y_train.mean() <= 0.1) * 3.0,
-        eval_metric="logloss", random_state=seed,
-    )
-    xgb_model.fit(X_train, y_train)
-    return {
-        "Logistic Regression": lr,
-        "Random Forest": rf,
-        "Gradient Boosting": gbt,
-        "XGBoost": xgb_model,
-    }
+def mrr(ranked_ids, relevant_ids):
+    relevant = set(relevant_ids)
+    for i, rid in enumerate(ranked_ids, 1):
+        if rid in relevant:
+            return 1.0 / i
+    return 0.0
 
 
-def woe_transform(df, feature, target, min_samples=5):
-    if df[feature].dtype == object or df[feature].nunique() < 10:
-        groups = df.groupby(feature)[target]
-    else:
-        df["_bin"] = pd.qcut(df[feature], 10, duplicates="drop")
-        groups = df.groupby("_bin")[target]
-    result = groups.agg(["count", "sum"])
-    result.columns = ["count", "event"]
-    result = result[result["count"] >= min_samples]
-    result["non_event"] = result["count"] - result["event"]
-    n_event_total = result["event"].sum()
-    n_non_event_total = result["non_event"].sum()
-    result["event_rate"] = (result["event"] + 0.5) / (n_event_total + 0.5)
-    result["non_event_rate"] = (result["non_event"] + 0.5) / (n_non_event_total + 0.5)
-    result["woe"] = np.log(result["event_rate"] / result["non_event_rate"])
-    result["iv"] = (result["event_rate"] - result["non_event_rate"]) * result["woe"]
-    return result
+def match_quality(ranked_relevances, k=5):
+    """Weighted match quality: sum(rel_i / log2(i+1)) / max_possible."""
+    r = np.asarray(ranked_relevances, dtype=float)[:k]
+    if r.size == 0:
+        return 0.0
+    weights = 1.0 / np.log2(np.arange(2, r.size + 2))
+    return float(np.sum(r * weights) / np.sum(weights * 4.0))  # normalize by max grade 4
+
+
+def jaccard_similarity(set1, set2) -> float:
+    """Jaccard similarity between two token sets."""
+    s1, s2 = set(set1), set(set2)
+    union = s1 | s2
+    return len(s1 & s2) / len(union) if union else 0.0
